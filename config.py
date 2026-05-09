@@ -37,5 +37,20 @@ class Config:
     # Batched training
     batch_size: int = 256
 
+    # Refiner architecture
+    lora_rank: int = 8
+    refiner_d: int = 128      # bottleneck dimension
+    refiner_layers: int = 2
+    refiner_heads: int = 4
+    noise_std: float = 0.1    # std of noise injected at bottleneck
+
+    # Intervention
+    n_samples: int = 1000                  # LoRA candidates per intervention
+    top_k_frac: float = 0.1               # top/bottom 10% → winners/losers
+    n_refiner_train: int = 32             # fresh samples for refiner gradient step
+    intervention_interval: int = 500      # normal training steps between interventions
+    refiner_start_iter: int = 5_000       # normal steps before first intervention
+    disc_warmup_interventions: int = 5    # interventions before refiner starts training
+
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
