@@ -109,10 +109,12 @@ def _train_disc_from_buffer(buffer, layer_idx, discriminator, disc_opt, device, 
 
 # ────────────────────────────────────────────────────────────────── intervention
 
-def run_intervention_disc(model, discriminator, val_data, layer_idx, cfg):
+def run_intervention_disc(model, discriminator, val_data, layer_idx, cfg, model_snap_buf=None):
     """
     Gradient ascent through the discriminator as a surrogate energy function.
-    Optimises the 'after' weights to maximise disc score, then commits if loss improves.
+    Uses a past snapshot as 'before' and current weights as 'after' (the good side),
+    then pushes 'after' further in the direction the discriminator scores as improving.
+    Commits if loss improves.
     """
     device = next(model.parameters()).device
     model.eval()
@@ -122,8 +124,22 @@ def run_intervention_disc(model, discriminator, val_data, layer_idx, cfg):
     rank_y = val_data[start + 1 : start + cfg.context_length + 1].unsqueeze(0)
 
     block_linears = get_block_linears(model.blocks[layer_idx])
-    before = [lin.weight.detach().unsqueeze(0) for lin in block_linears]
-    after  = [w.clone().requires_grad_(True) for w in before]
+    param_names = [
+        f"blocks.{layer_idx}.attn.qkv.weight",
+        f"blocks.{layer_idx}.attn.out_proj.weight",
+        f"blocks.{layer_idx}.ff.net.0.weight",
+        f"blocks.{layer_idx}.ff.net.2.weight",
+    ]
+
+    # after = current weights (good side to push further)
+    # before = past snapshot as historical anchor; fall back to current if buffer empty
+    after = [lin.weight.detach().unsqueeze(0).clone().requires_grad_(True)
+             for lin in block_linears]
+    if model_snap_buf and len(model_snap_buf) > 0:
+        snap = list(model_snap_buf)[torch.randint(len(model_snap_buf), (1,)).item()]
+        before = [snap[n].unsqueeze(0).to(device) for n in param_names]
+    else:
+        before = [a.detach().clone() for a in after]
 
     for p in discriminator.parameters():
         p.requires_grad_(False)
@@ -359,7 +375,7 @@ def train():
                 layer_idx = layer_cycle % cfg.n_layers
                 layer_cycle += 1
                 best_loss, baseline_loss, r_score, committed = run_intervention_disc(
-                    model, discriminator, val_data, layer_idx, cfg,
+                    model, discriminator, val_data, layer_idx, cfg, model_snap_buf,
                 )
                 intervention_count += 1
                 inter_best_sum  += best_loss

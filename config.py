@@ -46,7 +46,7 @@ class Config:
     # Intervention
     intervention_interval: int = 1000      # normal training steps between interventions
     intervention_commit_margin: float = 0.1  # commit if cand_loss <= baseline_loss + margin
-    disc_ascent_steps: int = 10           # gradient ascent steps through discriminator per intervention
+    disc_ascent_steps: int = 50           # gradient ascent steps through discriminator per intervention
     disc_ascent_lr: float = 1e-3          # step size (applied to unit-normalised gradient)
 
     # Discriminator training on GD transitions
