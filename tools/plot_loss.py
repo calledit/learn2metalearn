@@ -6,7 +6,6 @@ Usage:
 """
 
 import argparse
-import os
 
 import numpy as np
 import pandas as pd
@@ -46,8 +45,12 @@ def main():
             chunks.append(parts)
 
     df = pd.DataFrame(chunks, columns=header)
-    df["step"] = pd.to_numeric(df["step"], errors="coerce")
-    for col in ["train_loss", "val_loss", "lr", "elapsed_s", "tok_per_s"]:
+    numeric_cols = [
+        "step", "train_loss", "val_loss", "lr", "elapsed_s", "tok_per_s",
+        "disc_loss", "warmup_ref_loss", "interventions", "best_inter_loss",
+        "bad_ref_loss", "ref_gen_loss",
+    ]
+    for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -58,33 +61,64 @@ def main():
 
     print(f"Loaded {len(df)} rows, steps {df['step'].min():.0f} – {df['step'].max():.0f}")
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-    fig.suptitle("Generator Training", fontsize=14)
+    has_disc    = df["disc_loss"].notna().any()       if "disc_loss"       in df.columns else False
+    has_ref     = df["warmup_ref_loss"].notna().any() if "warmup_ref_loss" in df.columns else False
+    has_bad_ref = df["bad_ref_loss"].notna().any()    if "bad_ref_loss"    in df.columns else False
+    has_ref_gen = df["ref_gen_loss"].notna().any()    if "ref_gen_loss"    in df.columns else False
+    n_panels = 2 + (1 if has_disc or has_ref or has_bad_ref or has_ref_gen else 0)
 
-    def plot(ax, col, label, color, set_ylabel=True):
+    fig, axes = plt.subplots(n_panels, 1, figsize=(13, 4 * n_panels), sharex=True)
+    fig.suptitle("Training Curves", fontsize=14)
+
+    def plot(ax, col, label, color):
+        if col not in df.columns:
+            return
         data = df[col].dropna()
         if data.empty:
             return
         steps = df.loc[data.index, "step"]
-        ax.plot(steps, data, alpha=0.25, color=color, linewidth=0.8)
+        ax.plot(steps, data, alpha=0.2, color=color, linewidth=0.8)
         if len(data) >= args.smooth:
             s       = smooth(data.values, args.smooth)
             s_steps = steps.values[args.smooth - 1:]
             ax.plot(s_steps, s, color=color, linewidth=1.8, label=label)
         else:
             ax.plot(steps, data, color=color, linewidth=1.8, label=label)
-        if set_ylabel:
-            ax.set_ylabel(label)
         ax.legend(loc="upper right")
         ax.grid(True, alpha=0.3)
 
+    def scatter(ax, col, label, color, marker="x"):
+        if col not in df.columns:
+            return
+        data = df[col].dropna()
+        if data.empty:
+            return
+        steps = df.loc[data.index, "step"]
+        ax.scatter(steps, data, color=color, marker=marker, s=30, label=label, zorder=5)
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
+
+    # ── Panel 0: generator loss ───────────────────────────────────────────────
     plot(axes[0], "train_loss", "train loss", "steelblue")
     plot(axes[0], "val_loss",   "val loss",   "darkorange")
+    scatter(axes[0], "best_inter_loss", "intervention best", "crimson")
     axes[0].set_title("Cross-Entropy Loss")
+    axes[0].set_ylabel("loss")
 
-    plot(axes[1], "lr", "learning rate (Prodigy)", "seagreen")
-    axes[1].set_title("Learning Rate")
-    axes[1].set_yscale("log")
+    # ── Panel 1: discriminator + refiner warmup ───────────────────────────────
+    if has_disc or has_ref or has_bad_ref or has_ref_gen:
+        plot(axes[1], "disc_loss",       "disc loss",    "mediumpurple")
+        plot(axes[1], "warmup_ref_loss", "wr_loss",      "tomato")
+        plot(axes[1], "bad_ref_loss",    "bad_ref loss", "goldenrod")
+        plot(axes[1], "ref_gen_loss",    "ref_gen loss", "dodgerblue")
+        axes[1].set_title("Discriminator & Refiner Warmup")
+        axes[1].set_ylabel("loss")
+        axes[1].axhline(0, color="gray", linewidth=0.8, linestyle="--")
+
+    # ── Panel last: learning rate ─────────────────────────────────────────────
+    plot(axes[-1], "lr", "learning rate (Prodigy)", "seagreen")
+    axes[-1].set_title("Learning Rate")
+    axes[-1].set_yscale("log")
 
     axes[-1].set_xlabel("Step")
     plt.tight_layout()

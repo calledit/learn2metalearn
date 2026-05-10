@@ -1,13 +1,16 @@
 import csv
 import glob
+import importlib
 import itertools
 import os
 import time
+from collections import deque
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from prodigyopt import Prodigy
 
+import config as _config_module
 from config import Config
 from model import Generator, Refiner, Discriminator, get_block_linears, disc_hinge_loss
 from data import build_dataset
@@ -68,106 +71,175 @@ def evaluate(model: Generator, val_data: torch.Tensor, cfg: Config) -> float:
     return total / max(n, 1)
 
 
-# ────────────────────────────────────────────────────────────────── intervention
+# ─────────────────────────────────────── discriminator warmup (Phase 2)
 
-def run_intervention(model, refiner, discriminator, refiner_opt, disc_opt,
-                     val_data, layer_idx, intervention_count, cfg):
-    device = next(model.parameters()).device
-    model.eval()
-
-    # One random sequence from val_data as ranking signal
-    start   = torch.randint(0, len(val_data) - cfg.context_length - 1, (1,)).item()
-    rank_x  = val_data[start     : start + cfg.context_length    ].unsqueeze(0)
-    rank_y  = val_data[start + 1 : start + cfg.context_length + 1].unsqueeze(0)
-
-    target_block  = model.blocks[layer_idx]
-    block_linears = get_block_linears(target_block)  # [qkv, out_proj, ff_up, ff_down]
-    layer_weights = [lin.weight for lin in block_linears]
-
-    # ── Encode (once) ─────────────────────────────────────────────────────────
-    with torch.no_grad():
-        bw      = [w.detach().unsqueeze(0) for w in layer_weights]
-        latent  = refiner.encode(bw).squeeze(0)   # [4, refiner_d]
-
-    # ── Sample n_samples LoRA pairs, compute all deltas ───────────────────────
-    with torch.no_grad():
-        lora_pairs = refiner.sample(latent)
-        # lora_pairs: 4 × (A[n,out,r], B[n,r,in])
-        deltas = [torch.bmm(A, B) for A, B in lora_pairs]
-        # deltas[i]: [n_samples, out_i, in_i]
-
-    # ── Rank by loss (loop; each step only modifies one layer) ────────────────
-    losses = torch.zeros(cfg.n_samples, device=device)
-    with torch.inference_mode():
-        for s in range(cfg.n_samples):
-            for lin, delta in zip(block_linears, deltas):
-                lin.weight.data.add_(delta[s])
-            logits   = model(rank_x)
-            losses[s] = F.cross_entropy(logits.reshape(-1, cfg.vocab_size), rank_y.reshape(-1))
-            for lin, delta in zip(block_linears, deltas):
-                lin.weight.data.sub_(delta[s])
-
-    k          = max(1, int(cfg.n_samples * cfg.top_k_frac))
-    sorted_idx = losses.argsort()
-    winner_idx = sorted_idx[:k]
-    loser_idx  = sorted_idx[-k:]
-    best_idx   = sorted_idx[0].item()
-
-    # ── Build batched weight configs for discriminator ─────────────────────────
-    def make_batch(indices):
-        batch = []
-        for lin, delta in zip(block_linears, deltas):
-            W = lin.weight.detach()
-            batch.append(W.unsqueeze(0) + delta[indices])  # [k, out_i, in_i]
-        return batch
-
-    winner_weights = make_batch(winner_idx)
-    loser_weights  = make_batch(loser_idx)
-
-    # ── Train discriminator ────────────────────────────────────────────────────
-    real_scores = discriminator(winner_weights)
-    fake_scores = discriminator(loser_weights)
-    d_loss      = disc_hinge_loss(real_scores, fake_scores)
+def warmup_discriminator(discriminator, disc_opt, before_weights, after_weights, layer_idx):
+    """
+    before_weights / after_weights: list of 4 tensors each [B, out_i, in_i].
+    before has higher loss, after has lower loss within the same layer.
+    Real: [before → after].  Fake: [after → before].
+    """
+    real_scores = discriminator(before_weights, after_weights, layer_idx)
+    fake_scores = discriminator(after_weights, before_weights, layer_idx)
+    d_loss = disc_hinge_loss(real_scores, fake_scores)
     disc_opt.zero_grad()
     d_loss.backward()
     disc_opt.step()
+    return d_loss.item()
 
-    # ── Train refiner (after discriminator warmup) ─────────────────────────────
-    r_loss_val = 0.0
-    if intervention_count >= cfg.disc_warmup_interventions:
-        for p in discriminator.parameters():
-            p.requires_grad_(False)
 
-        bw_g    = [w.detach().unsqueeze(0) for w in layer_weights]
-        latent_g = refiner.encode(bw_g).squeeze(0)               # [4, refiner_d]
+# ──────────────────────────────────────── disc buffer training helper
 
-        n_rt     = cfg.n_refiner_train
-        latent_n = latent_g.unsqueeze(0).expand(n_rt, -1, -1).contiguous()
-        latent_n = latent_n + torch.randn_like(latent_n) * cfg.noise_std
-        fresh    = refiner.decode(latent_n)
+def _train_disc_from_buffer(buffer, layer_idx, discriminator, disc_opt, device, cfg):
+    """Sample random pairs from the buffer. Lower-loss entry is 'after', higher is 'before'."""
+    if len(buffer) < 2:
+        return None
+    buf = list(buffer)
+    max_unique_pairs = len(buf) * (len(buf) - 1) // 2
+    n = min(cfg.disc_n_pairs, max_unique_pairs // 4)
+    # Sample with replacement so small buffers still produce full batches
+    idx_a = torch.randint(len(buf), (n,)).tolist()
+    idx_b = torch.randint(len(buf), (n,)).tolist()
+    before_list, after_list = [], []
+    for a, b in zip(idx_a, idx_b):
+        lo, hi = (a, b) if buf[a][1] <= buf[b][1] else (b, a)
+        after_list.append(buf[lo][0])   # lower loss → after
+        before_list.append(buf[hi][0])  # higher loss → before
+    before_batch = [torch.stack([e[j] for e in before_list]).to(device) for j in range(4)]
+    after_batch  = [torch.stack([e[j] for e in after_list ]).to(device) for j in range(4)]
+    return warmup_discriminator(discriminator, disc_opt, before_batch, after_batch, layer_idx)
 
-        fresh_weights = []
-        for i, (A, B) in enumerate(fresh):
-            W = block_linears[i].weight.detach().unsqueeze(0)  # [1, out_i, in_i]
-            fresh_weights.append(W + torch.bmm(A, B))          # [n_rt, out_i, in_i]
 
-        r_scores   = discriminator(fresh_weights)
-        r_loss     = -r_scores.mean()
-        refiner_opt.zero_grad()
-        r_loss.backward()
-        refiner_opt.step()
-        r_loss_val = r_loss.item()
+# ──────────────────────────────────────── refiner generator-loss training
 
-        for p in discriminator.parameters():
-            p.requires_grad_(True)
+def train_refiner_on_gen_loss(refiner, model, refiner_opt, x, y, layer_idx, cfg, model_snap_buf):
+    """
+    Train refiner so its proposed deltas reduce generator cross-entropy.
+    Samples a full model snapshot for a coherent forward pass — the 4 target-layer
+    weights become snapshot_weights + refiner_delta, everything else comes from the
+    snapshot unchanged. Gradients flow: CE loss → deltas → refiner decoder/encoder.
+    """
+    if not model_snap_buf:
+        return None
 
-    # ── Commit best winner ─────────────────────────────────────────────────────
+    device = next(model.parameters()).device
+    buf  = list(model_snap_buf)
+    snap = buf[torch.randint(len(buf), (1,)).item()]
+
+    param_names = [
+        f"blocks.{layer_idx}.attn.qkv.weight",
+        f"blocks.{layer_idx}.attn.out_proj.weight",
+        f"blocks.{layer_idx}.ff.net.0.weight",
+        f"blocks.{layer_idx}.ff.net.2.weight",
+    ]
+    bw = [snap[name].unsqueeze(0).to(device) for name in param_names]
+
+    latent = refiner.encode(bw, layer_idx)
+    deltas = refiner.decode(latent)  # list of 4 [1, out_i, in_i]
+
+    param_name_set = set(param_names)
+    modified = {name: p.to(device) for name, p in snap.items() if name not in param_name_set}
+    for name, delta in zip(param_names, deltas):
+        modified[name] = snap[name].to(device) + delta.squeeze(0)
+
+    model.eval()
+    logits = torch.func.functional_call(model, modified, x, strict=False)
+    model.train()
+
+    gen_loss = F.cross_entropy(logits.reshape(-1, cfg.vocab_size), y.reshape(-1))
+    refiner_opt.zero_grad()
+    (gen_loss * cfg.ref_gen_loss_scale).backward()
+    refiner_opt.step()
+
+    return gen_loss.item()
+
+
+# ─────────────────────────────────────── refiner warmup (Phase 2.5)
+
+def warmup_refiner(refiner, discriminator, refiner_opt, refiner_buf, layer_idx, cfg, device):
+    """
+    Train refiner on real weight snapshots from refiner_buf.
+    Encodes each snapshot, decodes to get deltas, scores the transition with
+    the discriminator. No noise — diversity comes from the real samples.
+    """
+    if len(refiner_buf) < cfg.refiner_buffer_start:
+        return None
+
+    buf = list(refiner_buf)
+    n   = min(cfg.refiner_warmup_batch, len(buf))
+    idx = torch.randint(len(buf), (n,)).tolist()
+    sampled = [buf[i][0] for i in idx]   # each: list of 4 cpu tensors
+
+    base_batch = [torch.stack([s[j] for s in sampled]).to(device) for j in range(4)]
+
+    latents      = refiner.encode(base_batch, layer_idx)   # [n, 4*n_out, d]
+    fresh        = refiner.decode(latents)                  # list of 4 [n, out_i, in_i]
+    fresh_weights = [base + delta for base, delta in zip(base_batch, fresh)]
+
+    for p in discriminator.parameters():
+        p.requires_grad_(False)
+
+    r_scores = discriminator(base_batch, fresh_weights, layer_idx)
+    r_loss   = -r_scores.mean()
+    refiner_opt.zero_grad()
+    r_loss.backward()
+    refiner_opt.step()
+
+    for p in discriminator.parameters():
+        p.requires_grad_(True)
+
+    return r_loss.item()
+
+
+# ────────────────────────────────────────────────────────────────── intervention
+
+def run_intervention(model, refiner, discriminator, val_data, layer_idx, cfg):
+    device = next(model.parameters()).device
+    model.eval()
+
+    start  = torch.randint(0, len(val_data) - cfg.context_length - 1, (1,)).item()
+    rank_x = val_data[start     : start + cfg.context_length    ].unsqueeze(0)
+    rank_y = val_data[start + 1 : start + cfg.context_length + 1].unsqueeze(0)
+
+    block_linears = get_block_linears(model.blocks[layer_idx])
+    layer_weights = [lin.weight for lin in block_linears]
+
+    # ── Single deterministic refinement ───────────────────────────────────────
     with torch.no_grad():
+        bw     = [w.detach().unsqueeze(0) for w in layer_weights]
+        latent = refiner.encode(bw, layer_idx)   # [1, 4*n_out, d]
+        deltas = refiner.decode(latent)           # list of 4 [1, out_i, in_i]
+
+    # ── Baseline loss ─────────────────────────────────────────────────────────
+    with torch.inference_mode():
+        baseline_loss = F.cross_entropy(
+            model(rank_x).reshape(-1, cfg.vocab_size), rank_y.reshape(-1)
+        ).item()
+
+    # ── Evaluate candidate ────────────────────────────────────────────────────
+    with torch.inference_mode():
         for lin, delta in zip(block_linears, deltas):
-            lin.weight.data.add_(delta[best_idx])
+            lin.weight.data.add_(delta.squeeze(0))
+        cand_loss = F.cross_entropy(
+            model(rank_x).reshape(-1, cfg.vocab_size), rank_y.reshape(-1)
+        ).item()
+        for lin, delta in zip(block_linears, deltas):
+            lin.weight.data.sub_(delta.squeeze(0))
+
+    # ── Discriminator score on proposed transition (informational) ───────────
+    with torch.no_grad():
+        r_score = discriminator(bw, [d + base for d, base in zip(deltas, bw)], layer_idx).mean().item()
+
+    # ── Commit if better than baseline ────────────────────────────────────────
+    committed = False
+    if cand_loss <= baseline_loss + cfg.intervention_commit_margin:
+        with torch.no_grad():
+            for lin, delta in zip(block_linears, deltas):
+                lin.weight.data.add_(delta.squeeze(0))
+        committed = True
 
     model.train()
-    return losses[best_idx].item(), d_loss.item(), r_loss_val
+    return cand_loss, baseline_loss, r_score, committed
 
 
 # ──────────────────────────────────────────────────────────────────── training
@@ -175,6 +247,7 @@ def run_intervention(model, refiner, discriminator, refiner_opt, disc_opt,
 def train():
     cfg    = Config()
     device = torch.device(cfg.device)
+    _config_mtime = os.path.getmtime(_config_module.__file__)
     print(f"Device: {device}")
 
     train_dataset, val_data, tokenizer = build_dataset(cfg)
@@ -202,8 +275,24 @@ def train():
                           safeguard_warmup=True, use_bias_correction=True)
 
     # ── Resume from checkpoint ────────────────────────────────────────────────
-    grad_updates       = 0
-    intervention_count = 0
+    grad_updates        = 0
+    intervention_count  = 0
+    # Per-layer discriminator buffers — each entry: (list of 4 cpu tensors, float loss)
+    disc_buf          = [deque(maxlen=cfg.disc_buffer_size) for _ in range(cfg.n_layers)]
+    disc_layer_cycle  = 0
+    # Per-layer refiner buffers — snapshotted at disc_snapshot_interval//2 offset
+    refiner_buf       = [deque(maxlen=cfg.refiner_buffer_size) for _ in range(cfg.n_layers)]
+    refiner_layer_cycle = 0
+    # Full model snapshots for ref_gen training — coherent across all layers
+    model_snap_buf    = deque(maxlen=cfg.model_snap_buffer_size)
+    warmup_disc_sum   = 0.0
+    warmup_disc_count = 0
+    warmup_ref_sum    = 0.0
+    warmup_ref_count  = 0
+    bad_ref_sum       = 0.0
+    bad_ref_count     = 0
+    ref_gen_sum       = 0.0
+    ref_gen_count     = 0
 
     ckpt_path = find_latest_checkpoint(cfg.checkpoint_dir)
     if ckpt_path:
@@ -220,11 +309,17 @@ def train():
         optimizer.load_state_dict(ckpt["optimizer_state"])
         scheduler.load_state_dict(ckpt["scheduler_state"])
         if "refiner_state" in ckpt:
-            _load(refiner, "refiner_state")
-            refiner_opt.load_state_dict(ckpt["refiner_opt"])
+            try:
+                _load(refiner, "refiner_state")
+                refiner_opt.load_state_dict(ckpt["refiner_opt"])
+            except RuntimeError as e:
+                print(f"  [warn] refiner checkpoint incompatible, starting fresh: {e}")
         if "disc_state" in ckpt:
-            _load(discriminator, "disc_state")
-            disc_opt.load_state_dict(ckpt["disc_opt"])
+            try:
+                _load(discriminator, "disc_state")
+                disc_opt.load_state_dict(ckpt["disc_opt"])
+            except RuntimeError as e:
+                print(f"  [warn] discriminator checkpoint incompatible, starting fresh: {e}")
         grad_updates       = ckpt["grad_updates"]
         intervention_count = ckpt.get("intervention_count", 0)
         print(f"  resumed at step {grad_updates}, interventions {intervention_count}")
@@ -242,7 +337,8 @@ def train():
     if write_header:
         log_writer.writerow([
             "step", "train_loss", "val_loss", "lr", "elapsed_s", "tok_per_s",
-            "interventions", "best_inter_loss", "disc_loss", "refiner_loss",
+            "disc_loss", "warmup_ref_loss",
+            "interventions", "best_inter_loss", "bad_ref_loss", "ref_gen_loss",
         ])
 
     last_checkpoint_saved = grad_updates // cfg.checkpoint_interval
@@ -253,10 +349,8 @@ def train():
     tokens_since_log = 0
     # Intervention stats (averaged over the eval interval)
     inter_best_sum   = 0.0
-    inter_disc_sum   = 0.0
-    inter_ref_sum    = 0.0
+    inter_r_sum      = 0.0
     inter_count_log  = 0
-
     layer_cycle = 0   # which layer the next intervention targets
 
     for epoch in itertools.count(1):
@@ -287,24 +381,108 @@ def train():
             tokens_since_log += batch.size(0) * cfg.context_length
             grad_updates     += 1
 
-            # ── Intervention ──────────────────────────────────────────────────
+            # ── Discriminator + refiner training on GD transitions ───────────
+            if grad_updates >= cfg.disc_start_iter:
+                def _snap(layer_idx):
+                    lins = get_block_linears(model.blocks[layer_idx])
+                    return [l.weight.detach().cpu().clone() for l in lins]
+
+                if grad_updates % cfg.disc_snapshot_interval == 0:
+                    _li = disc_layer_cycle % cfg.n_layers
+                    disc_buf[_li].append((_snap(_li), loss.item()))
+                    disc_layer_cycle += 1
+
+                _refiner_offset = cfg.disc_snapshot_interval // 2
+                if grad_updates % cfg.disc_snapshot_interval == _refiner_offset:
+                    _li = refiner_layer_cycle % cfg.n_layers
+                    refiner_buf[_li].append((_snap(_li), loss.item()))
+                    refiner_layer_cycle += 1
+
+                _wr_fired = False
+                _ref_gen_active = not cfg.ref_gen_loss_end_iter or grad_updates < cfg.ref_gen_loss_end_iter
+                if _ref_gen_active and grad_updates % cfg.model_snap_interval == 0:
+                    model_snap_buf.append(
+                        {n: p.detach().cpu().clone() for n, p in model.named_parameters()}
+                    )
+                    if (len(model_snap_buf) == cfg.model_snap_buffer_size
+                            and grad_updates >= cfg.refiner_warmup_start_iter):
+                        _rg_li = (grad_updates // cfg.model_snap_interval) % cfg.n_layers
+                        wr = warmup_refiner(refiner, discriminator, refiner_opt,
+                                            refiner_buf[_rg_li], _rg_li, cfg, device)
+                        if wr is not None:
+                            warmup_ref_sum   += wr
+                            warmup_ref_count += 1
+                        rg = train_refiner_on_gen_loss(
+                            refiner, model, refiner_opt, x, y, _rg_li, cfg, model_snap_buf
+                        )
+                        if rg is not None:
+                            ref_gen_sum   += rg
+                            ref_gen_count += 1
+                        model_snap_buf.clear()
+                        _wr_fired = True
+
+                if grad_updates % cfg.disc_train_interval == 0:
+                    any_disc_trained = False
+                    for _li in range(cfg.n_layers):
+                        if len(disc_buf[_li]) >= cfg.disc_buffer_start:
+                            result = _train_disc_from_buffer(disc_buf[_li], _li, discriminator, disc_opt, device, cfg)
+                            if result is not None:
+                                warmup_disc_sum   += result
+                                warmup_disc_count += 1
+                                any_disc_trained   = True
+                    if any_disc_trained and grad_updates >= cfg.refiner_warmup_start_iter and not _wr_fired:
+                        _li = (grad_updates // cfg.disc_train_interval) % cfg.n_layers
+                        wr = warmup_refiner(refiner, discriminator, refiner_opt,
+                                            refiner_buf[_li], _li, cfg, device)
+                        if wr is not None:
+                            warmup_ref_sum   += wr
+                            warmup_ref_count += 1
+
+                        # Add one bad refiner sample to disc_buf so the discriminator
+                        # learns to detect degrading proposals. We only add it when it
+                        # increases loss (vs. current batch), and we take the first sample
+                        # so we only run one forward pass.
+                        with torch.no_grad():
+                            _block_lins = get_block_linears(model.blocks[_li])
+                            _lw = [lin.weight for lin in _block_lins]
+                            _bw = [w.detach().unsqueeze(0) for w in _lw]
+                            _lat = refiner.encode(_bw, _li)
+                            _lat = _lat + torch.randn_like(_lat) * cfg.noise_std
+                            _deltas = refiner.decode(_lat)   # list of 4 [1, out_i, in_i]
+                            for lin, d in zip(_block_lins, _deltas):
+                                lin.weight.data.add_(d.squeeze(0))
+                            model.eval()
+                            _cand_loss = F.cross_entropy(
+                                model(x).reshape(-1, cfg.vocab_size), y.reshape(-1)
+                            ).item()
+                            model.train()
+                            for lin, d in zip(_block_lins, _deltas):
+                                lin.weight.data.sub_(d.squeeze(0))
+                            if _cand_loss > loss.item():
+                                _snap_ref = [
+                                    (w.detach() + d.squeeze(0).detach()).cpu().clone()
+                                    for w, d in zip(_lw, _deltas)
+                                ]
+                                disc_buf[_li].append((_snap_ref, _cand_loss))
+                                bad_ref_sum   += _cand_loss
+                                bad_ref_count += 1
+
+            # ── Phase 3: intervention ─────────────────────────────────────────
             if (grad_updates >= cfg.refiner_start_iter
                     and grad_updates % cfg.intervention_interval == 0):
                 layer_idx = layer_cycle % cfg.n_layers
                 layer_cycle += 1
-                best_loss, d_loss, r_loss = run_intervention(
-                    model, refiner, discriminator, refiner_opt, disc_opt,
-                    val_data, layer_idx, intervention_count, cfg,
+                best_loss, baseline_loss, r_score, committed = run_intervention(
+                    model, refiner, discriminator, val_data, layer_idx, cfg,
                 )
                 intervention_count += 1
                 inter_best_sum  += best_loss
-                inter_disc_sum  += d_loss
-                inter_ref_sum   += r_loss
+                inter_r_sum     += r_score
                 inter_count_log += 1
                 print(
                     f"  [intervention {intervention_count}] "
-                    f"layer={layer_idx} | best_loss={best_loss:.4f} | "
-                    f"d_loss={d_loss:.4f} | r_loss={r_loss:.4f}"
+                    f"layer={layer_idx} | cand={best_loss:.4f} baseline={baseline_loss:.4f} | "
+                    f"r_score={r_score:.4f} | {'COMMITTED' if committed else 'skipped'}"
                 )
 
             # ── Eval + log ────────────────────────────────────────────────────
@@ -323,18 +501,34 @@ def train():
                 sample = generate(model, tokenizer, cfg, prompt="The history of", max_new_tokens=20)
                 model.train()
 
-                avg_best = inter_best_sum / inter_count_log if inter_count_log else 0.0
-                avg_disc = inter_disc_sum / inter_count_log if inter_count_log else 0.0
-                avg_ref  = inter_ref_sum  / inter_count_log if inter_count_log else 0.0
-                inter_best_sum = inter_disc_sum = inter_ref_sum = 0.0
+                avg_best  = inter_best_sum / inter_count_log if inter_count_log else 0.0
+                avg_rscore = inter_r_sum   / inter_count_log if inter_count_log else 0.0
+                avg_disc     = warmup_disc_sum / warmup_disc_count if warmup_disc_count else 0.0
+                avg_wref     = warmup_ref_sum  / warmup_ref_count  if warmup_ref_count  else 0.0
+                avg_bad_ref  = bad_ref_sum     / bad_ref_count     if bad_ref_count     else 0.0
+                avg_ref_gen  = ref_gen_sum     / ref_gen_count     if ref_gen_count     else 0.0
+                inter_best_sum  = 0.0
+                inter_r_sum     = 0.0
                 inter_count_log = 0
+                warmup_disc_sum   = 0.0
+                warmup_disc_count = 0
+                warmup_ref_sum    = 0.0
+                warmup_ref_count  = 0
+                bad_ref_sum   = 0.0
+                bad_ref_count = 0
+                ref_gen_sum   = 0.0
+                ref_gen_count = 0
 
                 print(
                     f"step {grad_updates:7d}/{cfg.max_iters} | "
                     f"t_loss {avg_train:.4f} | v_loss {val_loss:.4f} | "
                     f"lr {lr:.2e} | {tok_per_s:,.0f} tok/s | "
                     f"time: {elapsed:.0f}s | "
-                    f"samp: {' '.join(sample.split())}"
+                    + (f"disc_loss {avg_disc:.4f} | " if avg_disc else "")
+                    + (f"wr_loss {avg_wref:.4f} | "  if avg_wref  else "")
+                    + (f"bad_ref {avg_bad_ref:.4f} | " if avg_bad_ref else "")
+                    + (f"ref_gen {avg_ref_gen:.4f} | " if avg_ref_gen else "")
+                    + f"samp: {' '.join(sample.split())}"
                 )
                 log_writer.writerow([
                     grad_updates,
@@ -343,10 +537,12 @@ def train():
                     f"{lr:.6e}",
                     f"{elapsed:.1f}",
                     f"{tok_per_s:.0f}",
+                    f"{avg_disc:.6f}"   if avg_disc   else "",
+                    f"{avg_wref:.6f}"   if avg_wref   else "",
                     intervention_count,
-                    f"{avg_best:.6f}" if avg_best else "",
-                    f"{avg_disc:.6f}"  if avg_disc else "",
-                    f"{avg_ref:.6f}"   if avg_ref  else "",
+                    f"{avg_best:.6f}"   if avg_best   else "",
+                    f"{avg_bad_ref:.6f}" if avg_bad_ref else "",
+                    f"{avg_ref_gen:.6f}" if avg_ref_gen else "",
                 ])
                 log_file.flush()
 
@@ -357,6 +553,15 @@ def train():
                                 discriminator, disc_opt,
                                 grad_updates, intervention_count, cfg)
                 last_checkpoint_saved = current_interval
+
+                new_mtime = os.path.getmtime(_config_module.__file__)
+                if new_mtime != _config_mtime:
+                    _config_mtime = new_mtime
+                    answer = input("  [config] config.py changed — reload? [y/N] ").strip().lower()
+                    if answer == "y":
+                        importlib.reload(_config_module)
+                        cfg = _config_module.Config()
+                        print("  [config] reloaded")
 
         if grad_updates >= cfg.max_iters:
             break
