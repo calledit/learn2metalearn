@@ -118,7 +118,7 @@ def _make_mini_transformer(d: int, n_heads: int, n_layers: int) -> nn.Transforme
                                  norm=nn.LayerNorm(d), enable_nested_tensor=False)
 
 
-# ── Layer encoder (shared by Refiner and Discriminator) ───────────────────────
+# ── Layer encoder ─────────────────────────────────────────────────────────────
 
 class MatrixEncoder(nn.Module):
     """
@@ -165,94 +165,6 @@ class LayerEncoder(nn.Module):
         return torch.cat(tokens, dim=1)            # [B, 4*n_out, d]
 
 
-# ── Refiner ───────────────────────────────────────────────────────────────────
-
-class MatrixDecoder(nn.Module):
-    """
-    Reverse of MatrixEncoder: [B, n_out, d] → [B, out_dim, in_dim].
-    Learned queries (one per output row) attend to the n_out encoded tokens,
-    then project to in_dim. Mirrors the encoder cross-attention symmetrically.
-    """
-    def __init__(self, out_dim: int, in_dim: int, d: int, n_heads: int):
-        super().__init__()
-        self.queries    = nn.Parameter(torch.randn(out_dim, d) * 0.02)
-        self.cross_attn = nn.MultiheadAttention(d, n_heads, batch_first=True, bias=False)
-        self.out_proj   = nn.Linear(d, in_dim, bias=False)
-        self.norm       = nn.LayerNorm(d)
-        nn.init.zeros_(self.out_proj.weight)
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """z: [B, n_out, d] → [B, out_dim, in_dim]"""
-        B = z.size(0)
-        q = self.queries.unsqueeze(0).expand(B, -1, -1)
-        out, _ = self.cross_attn(q, z, z)
-        return self.out_proj(self.norm(out))
-
-
-class LayerDecoder(nn.Module):
-    """
-    Reverse of LayerEncoder: [B, 4*n_out, d] → list of 4 [B, out_i, in_i] residuals.
-    One MatrixDecoder per weight matrix type.
-    """
-    def __init__(self, cfg: Config):
-        super().__init__()
-        d, n_out, heads = cfg.refiner_d, cfg.encoder_n_out, cfg.refiner_heads
-        shapes = [
-            (3*cfg.d_model, cfg.d_model),  # qkv
-            (cfg.d_model,   cfg.d_model),  # out_proj
-            (4*cfg.d_model, cfg.d_model),  # ff_up
-            (cfg.d_model, 4*cfg.d_model),  # ff_down
-        ]
-        self.decoders = nn.ModuleList([
-            MatrixDecoder(od, id_, d, heads) for od, id_ in shapes
-        ])
-        self.n_out = n_out
-
-    def forward(self, latent: torch.Tensor) -> list:
-        """latent: [B, 4*n_out, d] → list of 4 [B, out_i, in_i]"""
-        return [dec(latent[:, i*self.n_out:(i+1)*self.n_out])
-                for i, dec in enumerate(self.decoders)]
-
-
-class Refiner(nn.Module):
-    """
-    Symmetric encoder-decoder over weight matrices.
-    Encode: weights → transformer bottleneck (with layer identity).
-    Decode: latent + noise → raw ΔW residuals (same shape as inputs).
-    """
-    def __init__(self, cfg: Config):
-        super().__init__()
-        self.cfg = cfg
-        dr = cfg.refiner_d
-
-        self.encoder     = LayerEncoder(cfg)
-        self.decoder     = LayerDecoder(cfg)
-        self.transformer = _make_mini_transformer(dr, cfg.refiner_heads, cfg.refiner_layers)
-        self.layer_emb   = nn.Embedding(cfg.n_layers, dr)
-        nn.init.normal_(self.layer_emb.weight, std=0.02)
-
-    def encode(self, weights: list, layer_idx: int) -> torch.Tensor:
-        """weights: list of 4 [B, out_i, in_i]. Returns [B, 4*n_out, refiner_d]."""
-        tokens = self.encoder(weights)
-        layer_token = self.layer_emb(torch.tensor(layer_idx, dtype=torch.long, device=tokens.device))
-        return self.transformer(tokens + layer_token)
-
-    def decode(self, latent: torch.Tensor) -> list:
-        """latent: [B, 4*n_out, refiner_d] → list of 4 [B, out_i, in_i] deltas."""
-        return self.decoder(latent)
-
-    def sample(self, latent_1: torch.Tensor) -> list:
-        """
-        latent_1: [4*n_out, refiner_d] — single squeezed encode output.
-        Injects noise and decodes cfg.n_samples times in one batched pass.
-        Returns list of 4 [n_samples, out_i, in_i] deltas.
-        """
-        n = self.cfg.n_samples
-        latent_n = latent_1.unsqueeze(0).expand(n, -1, -1).contiguous()
-        latent_n = latent_n + torch.randn_like(latent_n) * self.cfg.noise_std
-        return self.decode(latent_n)
-
-
 # ── Discriminator ──────────────────────────────────────────────────────────────
 
 class ScoreFunnel(nn.Module):
@@ -276,8 +188,8 @@ class Discriminator(nn.Module):
     Transition detector: takes two weight configurations (before, after) and
     scores whether the transition represents genuine improvement.
 
-    Real:  [worse, better] — the ordering the refiner should produce.
-    Fake:  [better, worse] — degradation, which the refiner should avoid.
+    Real:  [worse, better] — a genuine improvement transition.
+    Fake:  [better, worse] — a degrading transition.
 
     Encodes each set of 4 matrices to 4*n_out tokens, concatenates to 8*n_out,
     adds a layer embedding so the discriminator knows which layer it's judging,

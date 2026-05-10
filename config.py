@@ -37,43 +37,30 @@ class Config:
     # Batched training
     batch_size: int = 256
 
-    # Refiner architecture
+    # Discriminator / meta-network architecture (shared encoder)
     refiner_d: int = 128      # bottleneck dimension
     refiner_layers: int = 2
     refiner_heads: int = 4
-    noise_std: float = 0.1    # std of noise injected at bottleneck
     encoder_n_out: int = 4    # tokens produced per weight matrix by cross-attention
 
     # Intervention
-    n_samples: int = 500                  # refiner candidates per intervention
-    refiner_warmup_batch: int = 128        # real snapshots sampled from refiner_buf per warmup step
     intervention_interval: int = 1000      # normal training steps between interventions
     intervention_commit_margin: float = 0.1  # commit if cand_loss <= baseline_loss + margin
+    disc_ascent_steps: int = 10           # gradient ascent steps through discriminator per intervention
+    disc_ascent_lr: float = 1e-3          # step size (applied to unit-normalised gradient)
 
     # Discriminator training on GD transitions
     disc_start_iter: int = 20_000          # when discriminator training begins
     disc_buffer_size: int = 2048            # rolling window of snapshots per per-layer buffer
-    disc_buffer_start: int = 16           # minimum entries before discriminator training begins
-    disc_n_pairs: int = 128               # random pairs sampled per discriminator update
-    disc_snapshot_interval: int = 10      # steps between weight snapshots per layer cycle
-    disc_train_interval: int = 50        # steps between discriminator training steps
-    # Refiner buffer — real weight snapshots offset from disc snapshots by interval//2
-    refiner_buffer_size: int = 512
-    refiner_buffer_start: int = 8
-    # Full model snapshots for ref_gen training
+    disc_buffer_start: int = 16            # minimum entries before discriminator training begins
+    disc_n_pairs: int = 128                # random pairs sampled per discriminator update
+    disc_snapshot_interval: int = 10       # steps between weight snapshots per layer cycle
+    disc_train_interval: int = 50          # steps between discriminator training steps
+    disc_bad_sample_start_iter: int = 30_000  # when bad-sample generation via disc descent begins
+    # Full model snapshots — used as stable "before" starting points for disc descent bad samples
     model_snap_buffer_size: int = 10
     model_snap_interval: int = 50
-
-    # Refiner warmup (Phase 2.5) — refiner trains against discriminator, no weight commits
-    refiner_warmup_start_iter: int = 30_000
-    # ref_gen_loss anchors the refiner toward proposals that actually reduce generator loss,
-    # preventing the refiner from constantly wandering from bad to bad guided by negative feadback from the discriminator.
-    # The risk of too much ref_gen signal is that the refiner learns to replicate gradient
-    # descent on the snapshot batch — effectively running GD many times on the same data,
-    # which drives weights into extreme local optima. Keep scale small. May be usefull to have it higher initaully durring warmup
-    ref_gen_loss_scale: float = 0.01        # loss multiplier — reduces gradient magnitude
-    ref_gen_loss_end_iter: int = 60_000   # stop gen-loss refiner training at this step (0 = never)
-    refiner_start_iter: int = 45_000      # when interventions (Phase 3) begin
+    refiner_start_iter: int = 45_000       # when interventions (Phase 3) begin
 
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

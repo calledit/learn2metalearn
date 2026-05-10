@@ -47,8 +47,7 @@ def main():
     df = pd.DataFrame(chunks, columns=header)
     numeric_cols = [
         "step", "train_loss", "val_loss", "lr", "elapsed_s", "tok_per_s",
-        "disc_loss", "warmup_ref_loss", "interventions", "best_inter_loss",
-        "bad_ref_loss", "ref_gen_loss",
+        "disc_loss", "interventions", "best_inter_loss", "bad_sample_loss",
     ]
     for col in numeric_cols:
         if col in df.columns:
@@ -61,11 +60,9 @@ def main():
 
     print(f"Loaded {len(df)} rows, steps {df['step'].min():.0f} – {df['step'].max():.0f}")
 
-    has_disc    = df["disc_loss"].notna().any()       if "disc_loss"       in df.columns else False
-    has_ref     = df["warmup_ref_loss"].notna().any() if "warmup_ref_loss" in df.columns else False
-    has_bad_ref = df["bad_ref_loss"].notna().any()    if "bad_ref_loss"    in df.columns else False
-    has_ref_gen = df["ref_gen_loss"].notna().any()    if "ref_gen_loss"    in df.columns else False
-    n_panels = 2 + (1 if has_disc or has_ref or has_bad_ref or has_ref_gen else 0)
+    has_disc        = df["disc_loss"].notna().any()        if "disc_loss"        in df.columns else False
+    has_bad_sample  = df["bad_sample_loss"].notna().any() if "bad_sample_loss"  in df.columns else False
+    n_panels = 2 + (1 if has_disc or has_bad_sample else 0)
 
     fig, axes = plt.subplots(n_panels, 1, figsize=(13, 4 * n_panels), sharex=True)
     fig.suptitle("Training Curves", fontsize=14)
@@ -105,13 +102,11 @@ def main():
     axes[0].set_title("Cross-Entropy Loss")
     axes[0].set_ylabel("loss")
 
-    # ── Panel 1: discriminator + refiner warmup ───────────────────────────────
-    if has_disc or has_ref or has_bad_ref or has_ref_gen:
-        plot(axes[1], "disc_loss",       "disc loss",    "mediumpurple")
-        plot(axes[1], "warmup_ref_loss", "wr_loss",      "tomato")
-        plot(axes[1], "bad_ref_loss",    "bad_ref loss", "goldenrod")
-        plot(axes[1], "ref_gen_loss",    "ref_gen loss", "dodgerblue")
-        axes[1].set_title("Discriminator & Refiner Warmup")
+    # ── Panel 1: discriminator ────────────────────────────────────────────────
+    if has_disc or has_bad_sample:
+        plot(axes[1], "disc_loss",       "disc loss",       "mediumpurple")
+        plot(axes[1], "bad_sample_loss", "bad sample loss", "goldenrod")
+        axes[1].set_title("Discriminator")
         axes[1].set_ylabel("loss")
         axes[1].axhline(0, color="gray", linewidth=0.8, linestyle="--")
 
