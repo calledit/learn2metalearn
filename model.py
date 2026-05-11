@@ -185,22 +185,24 @@ class ScoreFunnel(nn.Module):
 
 class Discriminator(nn.Module):
     """
-    Transition detector: takes two weight configurations (before, after) and
-    scores whether the transition represents genuine improvement.
+    Transition detector: takes two full model weight configurations (before, after)
+    across all n_layers transformer blocks and scores whether the transition
+    represents genuine improvement.
 
     Real:  [worse, better] — a genuine improvement transition.
     Fake:  [better, worse] — a degrading transition.
 
-    Encodes each set of 4 matrices to 4*n_out tokens, concatenates to 8*n_out,
-    adds a layer embedding so the discriminator knows which layer it's judging,
-    then scores the full transition with a learned funnel.
+    Each side encodes n_layers blocks as n_layers * 4 * n_out tokens with per-layer
+    embeddings, giving 2 * n_layers * 4 * n_out tokens total to the transformer.
     """
     def __init__(self, cfg: Config):
         super().__init__()
-        dr = cfg.refiner_d
+        dr    = cfg.refiner_d
+        n_tok = 2 * cfg.n_layers * 4 * cfg.encoder_n_out
+        self.n_layers    = cfg.n_layers
         self.encoder     = LayerEncoder(cfg)
         self.transformer = _make_mini_transformer(dr, cfg.refiner_heads, cfg.refiner_layers)
-        self.funnel      = ScoreFunnel(dr, 8 * cfg.encoder_n_out)
+        self.funnel      = ScoreFunnel(dr, n_tok)
         self.layer_emb   = nn.Embedding(cfg.n_layers, dr)
         nn.init.normal_(self.layer_emb.weight, std=0.02)
         self._apply_spectral_norm()
@@ -215,23 +217,22 @@ class Discriminator(nn.Module):
                 if id(mod) not in mha_ids and isinstance(mod, nn.Linear):
                     SN(mod)
 
-    def forward(self, weights_before: list, weights_after: list,
-                layer_idx: "int | torch.Tensor") -> torch.Tensor:
+    def forward(self, weights_before: list, weights_after: list) -> torch.Tensor:
         """
-        weights_before, weights_after: each a list of 4 [B, out_i, in_i].
-        layer_idx: int (broadcast) or [B] LongTensor (per-sample).
+        weights_before, weights_after: each a list of n_layers entries,
+            each entry a list of 4 [B, out_i, in_i] tensors.
         Returns scores [B].
         """
-        tokens = torch.cat([
-            self.encoder(weights_before),   # [B, 4*n_out, dr]
-            self.encoder(weights_after),    # [B, 4*n_out, dr]
-        ], dim=1)                           # [B, 8*n_out, dr]
-        B = tokens.size(0)
-        if isinstance(layer_idx, int):
-            idx = torch.full((B,), layer_idx, dtype=torch.long, device=tokens.device)
-        else:
-            idx = layer_idx.to(tokens.device)
-        tokens = tokens + self.layer_emb(idx).unsqueeze(1)  # [B, 8*n_out, dr]
+        all_tokens = []
+        for side in [weights_before, weights_after]:
+            for li, layer_weights in enumerate(side):
+                tokens = self.encoder(layer_weights)  # [B, 4*n_out, dr]
+                B = tokens.size(0)
+                emb = self.layer_emb(
+                    torch.full((B,), li, dtype=torch.long, device=tokens.device)
+                )
+                all_tokens.append(tokens + emb.unsqueeze(1))
+        tokens = torch.cat(all_tokens, dim=1)          # [B, 2*n_layers*4*n_out, dr]
         return self.funnel(self.transformer(tokens))
 
 

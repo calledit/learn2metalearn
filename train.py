@@ -68,16 +68,30 @@ def evaluate(model: Generator, val_data: torch.Tensor, cfg: Config) -> float:
     return total / max(n, 1)
 
 
-# ─────────────────────────────────────── discriminator warmup (Phase 2)
+# ─────────────────────────────────────── discriminator helpers
 
-def warmup_discriminator(discriminator, disc_opt, before_weights, after_weights, layer_idx):
+def _all_layer_weights(snap_state: dict, n_layers: int, device) -> list:
+    """Extract all transformer block weights from a state dict as list[list[Tensor]]."""
+    result = []
+    for li in range(n_layers):
+        names = [
+            f"blocks.{li}.attn.qkv.weight",
+            f"blocks.{li}.attn.out_proj.weight",
+            f"blocks.{li}.ff.net.0.weight",
+            f"blocks.{li}.ff.net.2.weight",
+        ]
+        result.append([snap_state[n].unsqueeze(0).to(device) for n in names])
+    return result
+
+
+def warmup_discriminator(discriminator, disc_opt, before_weights, after_weights):
     """
-    before_weights / after_weights: list of 4 tensors each [B, out_i, in_i].
-    before has higher loss, after has lower loss within the same layer.
+    before_weights / after_weights: list of n_layers entries, each a list of
+    4 [B, out_i, in_i] tensors. before has higher loss, after has lower loss.
     Real: [before → after].  Fake: [after → before].
     """
-    real_scores = discriminator(before_weights, after_weights, layer_idx)
-    fake_scores = discriminator(after_weights, before_weights, layer_idx)
+    real_scores = discriminator(before_weights, after_weights)
+    fake_scores = discriminator(after_weights, before_weights)
     d_loss = disc_hinge_loss(real_scores, fake_scores)
     disc_opt.zero_grad()
     d_loss.backward()
@@ -85,35 +99,54 @@ def warmup_discriminator(discriminator, disc_opt, before_weights, after_weights,
     return d_loss.item()
 
 
-# ──────────────────────────────────────── disc buffer training helper
-
-def _train_disc_from_buffer(buffer, layer_idx, discriminator, disc_opt, device, cfg):
-    """Sample random pairs from the buffer. Lower-loss entry is 'after', higher is 'before'."""
-    if len(buffer) < 2:
+def _train_disc_from_snaps(snap_buf, bad_sample_buf, discriminator, disc_opt, device, cfg):
+    """Sample pairs from full-model snapshots and explicit bad sample pairs."""
+    buf = list(snap_buf)
+    if len(buf) < 2:
         return None
-    buf = list(buffer)
-    max_unique_pairs = len(buf) * (len(buf) - 1) // 2
-    n = min(cfg.disc_n_pairs, max_unique_pairs // 4)
-    # Sample with replacement so small buffers still produce full batches
+    n = min(cfg.disc_n_pairs, len(buf) * (len(buf) - 1) // 2)
     idx_a = torch.randint(len(buf), (n,)).tolist()
     idx_b = torch.randint(len(buf), (n,)).tolist()
-    before_list, after_list = [], []
+    before_snaps, after_snaps = [], []
     for a, b in zip(idx_a, idx_b):
         lo, hi = (a, b) if buf[a][1] <= buf[b][1] else (b, a)
-        after_list.append(buf[lo][0])   # lower loss → after
-        before_list.append(buf[hi][0])  # higher loss → before
-    before_batch = [torch.stack([e[j] for e in before_list]).to(device) for j in range(4)]
-    after_batch  = [torch.stack([e[j] for e in after_list ]).to(device) for j in range(4)]
-    return warmup_discriminator(discriminator, disc_opt, before_batch, after_batch, layer_idx)
+        after_snaps.append(buf[lo][0])   # lower loss → after
+        before_snaps.append(buf[hi][0])  # higher loss → before
+
+    # Append explicit (bad, good) pairs from bad sample buffer
+    if bad_sample_buf:
+        bad_buf = list(bad_sample_buf)
+        n_bad = min(cfg.disc_bad_n_pairs, len(bad_buf))
+        bad_idx = torch.randint(len(bad_buf), (n_bad,)).tolist()
+        for i in bad_idx:
+            bad_state, good_state = bad_buf[i]
+            before_snaps.append(bad_state)   # bad → before
+            after_snaps.append(good_state)   # good → after
+
+    def _batch(snap_list):
+        batched = []
+        for li in range(cfg.n_layers):
+            names = [
+                f"blocks.{li}.attn.qkv.weight",
+                f"blocks.{li}.attn.out_proj.weight",
+                f"blocks.{li}.ff.net.0.weight",
+                f"blocks.{li}.ff.net.2.weight",
+            ]
+            batched.append([
+                torch.stack([s[name] for s in snap_list]).to(device) for name in names
+            ])
+        return batched
+
+    return warmup_discriminator(discriminator, disc_opt, _batch(before_snaps), _batch(after_snaps))
 
 
 # ────────────────────────────────────────────────────────────────── intervention
 
-def run_intervention_disc(model, discriminator, val_data, layer_idx, cfg, model_snap_buf=None):
+def run_intervention_disc(model, discriminator, val_data, cfg, model_snap_buf=None):
     """
-    Gradient ascent through the discriminator as a surrogate energy function.
-    Uses a past snapshot as 'before' and current weights as 'after' (the good side),
-    then pushes 'after' further in the direction the discriminator scores as improving.
+    Gradient ascent through the discriminator across all transformer layers.
+    Uses a past snapshot as 'before' and current weights (all layers) as 'after',
+    pushing 'after' further in the direction the discriminator scores as improving.
     Commits if loss improves.
     """
     device = next(model.parameters()).device
@@ -123,35 +156,34 @@ def run_intervention_disc(model, discriminator, val_data, layer_idx, cfg, model_
     rank_x = val_data[start     : start + cfg.context_length    ].unsqueeze(0)
     rank_y = val_data[start + 1 : start + cfg.context_length + 1].unsqueeze(0)
 
-    block_linears = get_block_linears(model.blocks[layer_idx])
-    param_names = [
-        f"blocks.{layer_idx}.attn.qkv.weight",
-        f"blocks.{layer_idx}.attn.out_proj.weight",
-        f"blocks.{layer_idx}.ff.net.0.weight",
-        f"blocks.{layer_idx}.ff.net.2.weight",
-    ]
+    all_block_linears = [get_block_linears(model.blocks[li]) for li in range(cfg.n_layers)]
 
-    # after = current weights (good side to push further)
+    # after = current weights across all layers (the good side to push further)
     # before = past snapshot as historical anchor; fall back to current if buffer empty
-    after = [lin.weight.detach().unsqueeze(0).clone().requires_grad_(True)
-             for lin in block_linears]
+    after = [
+        [lin.weight.detach().unsqueeze(0).clone().requires_grad_(True) for lin in lins]
+        for lins in all_block_linears
+    ]
     if model_snap_buf and len(model_snap_buf) > 0:
-        snap = list(model_snap_buf)[torch.randint(len(model_snap_buf), (1,)).item()]
-        before = [snap[n].unsqueeze(0).to(device) for n in param_names]
+        snap, _ = list(model_snap_buf)[torch.randint(len(model_snap_buf), (1,)).item()]
+        before = _all_layer_weights(snap, cfg.n_layers, device)
     else:
-        before = [a.detach().clone() for a in after]
+        before = [[w.detach().clone() for w in layer] for layer in after]
 
     for p in discriminator.parameters():
         p.requires_grad_(False)
 
+    flat_after = [w for layer in after for w in layer]
     for _ in range(cfg.disc_ascent_steps):
-        score = discriminator(before, after, layer_idx)
-        grads = torch.autograd.grad(score.mean(), after)
+        after_nested = [flat_after[li * 4:(li + 1) * 4] for li in range(cfg.n_layers)]
+        score = discriminator(before, after_nested)
+        grads = torch.autograd.grad(score.mean(), flat_after)
         total_norm = sum(g.norm() ** 2 for g in grads) ** 0.5 + 1e-8
         with torch.no_grad():
-            after = [a + cfg.disc_ascent_lr * g / total_norm
-                     for a, g in zip(after, grads)]
-        after = [a.requires_grad_(True) for a in after]
+            flat_after = [a + cfg.disc_ascent_lr * g / total_norm
+                          for a, g in zip(flat_after, grads)]
+        flat_after = [a.requires_grad_(True) for a in flat_after]
+    after = [flat_after[li * 4:(li + 1) * 4] for li in range(cfg.n_layers)]
 
     for p in discriminator.parameters():
         p.requires_grad_(True)
@@ -161,23 +193,27 @@ def run_intervention_disc(model, discriminator, val_data, layer_idx, cfg, model_
             model(rank_x).reshape(-1, cfg.vocab_size), rank_y.reshape(-1)
         ).item()
 
+    original = [[lin.weight.data.clone() for lin in lins] for lins in all_block_linears]
     with torch.inference_mode():
-        for lin, a in zip(block_linears, after):
-            lin.weight.data.copy_(a.detach().squeeze(0))
+        for li, lins in enumerate(all_block_linears):
+            for lin, a in zip(lins, after[li]):
+                lin.weight.data.copy_(a.detach().squeeze(0))
         cand_loss = F.cross_entropy(
             model(rank_x).reshape(-1, cfg.vocab_size), rank_y.reshape(-1)
         ).item()
-        for lin, b in zip(block_linears, before):
-            lin.weight.data.copy_(b.squeeze(0))
+        for li, lins in enumerate(all_block_linears):
+            for lin, orig in zip(lins, original[li]):
+                lin.weight.data.copy_(orig)
 
     with torch.no_grad():
-        r_score = discriminator(before, after, layer_idx).mean().item()
+        r_score = discriminator(before, after).mean().item()
 
     committed = False
     if cand_loss <= baseline_loss + cfg.intervention_commit_margin:
         with torch.no_grad():
-            for lin, a in zip(block_linears, after):
-                lin.weight.data.copy_(a.detach().squeeze(0))
+            for li, lins in enumerate(all_block_linears):
+                for lin, a in zip(lins, after[li]):
+                    lin.weight.data.copy_(a.detach().squeeze(0))
         committed = True
 
     model.train()
@@ -215,9 +251,8 @@ def train():
     # ── Resume from checkpoint ────────────────────────────────────────────────
     grad_updates        = 0
     intervention_count  = 0
-    disc_buf          = [deque(maxlen=cfg.disc_buffer_size) for _ in range(cfg.n_layers)]
-    disc_layer_cycle  = 0
-    model_snap_buf    = deque(maxlen=cfg.model_snap_buffer_size)
+    model_snap_buf    = deque(maxlen=cfg.model_snap_buffer_size)  # (state_dict, loss)
+    bad_sample_buf    = deque(maxlen=cfg.bad_sample_buffer_size)  # (bad_state_dict, good_state_dict)
     warmup_disc_sum   = 0.0
     warmup_disc_count = 0
     bad_sample_sum    = 0.0
@@ -273,7 +308,6 @@ def train():
     inter_best_sum   = 0.0
     inter_r_sum      = 0.0
     inter_count_log  = 0
-    layer_cycle = 0   # which layer the next intervention targets
 
     for epoch in itertools.count(1):
         for batch in loader:
@@ -305,77 +339,74 @@ def train():
 
             # ── Discriminator training on GD transitions ─────────────────────
             if grad_updates >= cfg.disc_start_iter:
-                def _snap(layer_idx):
-                    lins = get_block_linears(model.blocks[layer_idx])
-                    return [l.weight.detach().cpu().clone() for l in lins]
-
-                if grad_updates % cfg.disc_snapshot_interval == 0:
-                    _li = disc_layer_cycle % cfg.n_layers
-                    disc_buf[_li].append((_snap(_li), loss.item()))
-                    disc_layer_cycle += 1
-
                 if grad_updates % cfg.model_snap_interval == 0:
-                    model_snap_buf.append(
-                        {n: p.detach().cpu().clone() for n, p in model.named_parameters()}
-                    )
+                    model_snap_buf.append((
+                        {n: p.detach().cpu().clone() for n, p in model.named_parameters()},
+                        loss.item(),
+                    ))
 
-                if grad_updates % cfg.disc_train_interval == 0:
-                    any_disc_trained = False
-                    for _li in range(cfg.n_layers):
-                        if len(disc_buf[_li]) >= cfg.disc_buffer_start:
-                            result = _train_disc_from_buffer(disc_buf[_li], _li, discriminator, disc_opt, device, cfg)
-                            if result is not None:
-                                warmup_disc_sum   += result
-                                warmup_disc_count += 1
-                                any_disc_trained   = True
-                    if any_disc_trained and grad_updates >= cfg.disc_bad_sample_start_iter and model_snap_buf:
-                        _li = (grad_updates // cfg.disc_train_interval) % cfg.n_layers
-                        _snap_state = list(model_snap_buf)[torch.randint(len(model_snap_buf), (1,)).item()]
-                        _param_names = [
-                            f"blocks.{_li}.attn.qkv.weight",
-                            f"blocks.{_li}.attn.out_proj.weight",
-                            f"blocks.{_li}.ff.net.0.weight",
-                            f"blocks.{_li}.ff.net.2.weight",
-                        ]
-                        _bw = [_snap_state[name].unsqueeze(0).to(device) for name in _param_names]
-                        _after_bad = [w.clone().requires_grad_(True) for w in _bw]
+                if grad_updates % cfg.disc_train_interval == 0 and len(model_snap_buf) >= cfg.disc_snap_min:
+                    result = _train_disc_from_snaps(model_snap_buf, bad_sample_buf, discriminator, disc_opt, device, cfg)
+                    if result is not None:
+                        warmup_disc_sum   += result
+                        warmup_disc_count += 1
+
+                if (grad_updates >= cfg.disc_bad_sample_start_iter
+                        and grad_updates % cfg.disc_bad_sample_interval == 0
+                        and len(model_snap_buf) >= cfg.disc_snap_min):
+                        _snap_state, _snap_loss = list(model_snap_buf)[torch.randint(len(model_snap_buf), (1,)).item()]
+                        _before_bad = _all_layer_weights(_snap_state, cfg.n_layers, device)
+                        _flat_bad = [w.clone().requires_grad_(True)
+                                     for layer in _before_bad for w in layer]
                         for p in discriminator.parameters():
                             p.requires_grad_(False)
                         for _ in range(cfg.disc_ascent_steps):
-                            _score = discriminator(_bw, _after_bad, _li)
-                            _grads = torch.autograd.grad(_score.mean(), _after_bad)
+                            _bad_nested = [_flat_bad[li * 4:(li + 1) * 4] for li in range(cfg.n_layers)]
+                            _score = discriminator(_before_bad, _bad_nested)
+                            _grads = torch.autograd.grad(_score.mean(), _flat_bad)
                             _norm  = sum(g.norm() ** 2 for g in _grads) ** 0.5 + 1e-8
                             with torch.no_grad():
-                                _after_bad = [a - cfg.disc_ascent_lr * g / _norm
-                                              for a, g in zip(_after_bad, _grads)]
-                            _after_bad = [a.requires_grad_(True) for a in _after_bad]
+                                _flat_bad = [a - cfg.disc_ascent_lr * g / _norm
+                                             for a, g in zip(_flat_bad, _grads)]
+                            _flat_bad = [a.requires_grad_(True) for a in _flat_bad]
                         for p in discriminator.parameters():
                             p.requires_grad_(True)
-                        _block_lins = get_block_linears(model.blocks[_li])
-                        _orig = [lin.weight.data.clone() for lin in _block_lins]
+
+                        _all_lins = [get_block_linears(model.blocks[li]) for li in range(cfg.n_layers)]
+                        _orig_all = [[lin.weight.data.clone() for lin in lins] for lins in _all_lins]
                         with torch.no_grad():
-                            for lin, a in zip(_block_lins, _after_bad):
-                                lin.weight.data.copy_(a.detach().squeeze(0))
+                            for li, lins in enumerate(_all_lins):
+                                for lin, a in zip(lins, _flat_bad[li * 4:(li + 1) * 4]):
+                                    lin.weight.data.copy_(a.detach().squeeze(0))
                             model.eval()
                             _cand_loss = F.cross_entropy(
                                 model(x).reshape(-1, cfg.vocab_size), y.reshape(-1)
                             ).item()
                             model.train()
-                            for lin, orig in zip(_block_lins, _orig):
-                                lin.weight.data.copy_(orig)
-                        if _cand_loss > loss.item():
-                            _snap_bad = [a.detach().squeeze(0).cpu().clone() for a in _after_bad]
-                            disc_buf[_li].append((_snap_bad, _cand_loss))
+                            for li, lins in enumerate(_all_lins):
+                                for lin, orig in zip(lins, _orig_all[li]):
+                                    lin.weight.data.copy_(orig)
+
+                        if _cand_loss > _snap_loss * cfg.disc_bad_sample_margin:
+                            bad_state = dict(_snap_state)
+                            for li in range(cfg.n_layers):
+                                _names = [
+                                    f"blocks.{li}.attn.qkv.weight",
+                                    f"blocks.{li}.attn.out_proj.weight",
+                                    f"blocks.{li}.ff.net.0.weight",
+                                    f"blocks.{li}.ff.net.2.weight",
+                                ]
+                                for name, a in zip(_names, _flat_bad[li * 4:(li + 1) * 4]):
+                                    bad_state[name] = a.detach().squeeze(0).cpu().clone()
+                            bad_sample_buf.append((bad_state, _snap_state))
                             bad_sample_sum   += _cand_loss
                             bad_sample_count += 1
 
             # ── Phase 3: intervention ─────────────────────────────────────────
             if (grad_updates >= cfg.refiner_start_iter
                     and grad_updates % cfg.intervention_interval == 0):
-                layer_idx = layer_cycle % cfg.n_layers
-                layer_cycle += 1
                 best_loss, baseline_loss, r_score, committed = run_intervention_disc(
-                    model, discriminator, val_data, layer_idx, cfg, model_snap_buf,
+                    model, discriminator, val_data, cfg, model_snap_buf,
                 )
                 intervention_count += 1
                 inter_best_sum  += best_loss
@@ -383,7 +414,7 @@ def train():
                 inter_count_log += 1
                 print(
                     f"  [intervention {intervention_count}] "
-                    f"layer={layer_idx} | cand={best_loss:.4f} baseline={baseline_loss:.4f} | "
+                    f"cand={best_loss:.4f} baseline={baseline_loss:.4f} | "
                     f"r_score={r_score:.4f} | {'COMMITTED' if committed else 'skipped'}"
                 )
 

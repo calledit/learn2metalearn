@@ -2,7 +2,7 @@
 plot_loss.py — plot training curves from checkpoints/training_log.csv
 
 Usage:
-    python tools/plot_loss.py [--log PATH] [--smooth N] [--start STEP]
+    python tools/plot_loss.py [--log PATH] [--smooth N] [--start STEP] [--deriv-smooth N]
 """
 
 import argparse
@@ -21,9 +21,10 @@ def smooth(values, window):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--log",    default="checkpoints/training_log.csv")
-    parser.add_argument("--smooth", type=int, default=20, help="Smoothing window (steps)")
-    parser.add_argument("--start",  type=int, default=0,  help="Ignore steps before this value")
+    parser.add_argument("--log",          default="checkpoints/training_log.csv")
+    parser.add_argument("--smooth",       type=int, default=20,  help="Smoothing window (steps)")
+    parser.add_argument("--deriv-smooth", type=int, default=100, help="Extra smoothing before computing derivative")
+    parser.add_argument("--start",        type=int, default=0,   help="Ignore steps before this value")
     args = parser.parse_args()
 
     # Read robustly — handles resumed runs where the header may repeat
@@ -62,7 +63,7 @@ def main():
 
     has_disc        = df["disc_loss"].notna().any()        if "disc_loss"        in df.columns else False
     has_bad_sample  = df["bad_sample_loss"].notna().any() if "bad_sample_loss"  in df.columns else False
-    n_panels = 2 + (1 if has_disc or has_bad_sample else 0)
+    n_panels = 3 + (1 if has_disc or has_bad_sample else 0)
 
     fig, axes = plt.subplots(n_panels, 1, figsize=(13, 4 * n_panels), sharex=True)
     fig.suptitle("Training Curves", fontsize=14)
@@ -84,6 +85,23 @@ def main():
         ax.legend(loc="upper right")
         ax.grid(True, alpha=0.3)
 
+    def plot_deriv(ax, col, label, color):
+        """Plot the numerical derivative of the smoothed loss curve."""
+        if col not in df.columns:
+            return
+        data = df[col].dropna()
+        w = max(args.deriv_smooth, args.smooth)
+        if len(data) < w + 1:
+            return
+        steps = df.loc[data.index, "step"].values
+        s = smooth(data.values, w)
+        s_steps = steps[w - 1:]
+        deriv = np.gradient(s, s_steps)
+        ax.plot(s_steps, deriv, color=color, linewidth=1.5, label=label)
+        ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
+
     def scatter(ax, col, label, color, marker="x"):
         if col not in df.columns:
             return
@@ -102,13 +120,19 @@ def main():
     axes[0].set_title("Cross-Entropy Loss")
     axes[0].set_ylabel("loss")
 
-    # ── Panel 1: discriminator ────────────────────────────────────────────────
+    # ── Panel 1: loss derivative ──────────────────────────────────────────────
+    plot_deriv(axes[1], "train_loss", "d(train loss)/d(step)", "steelblue")
+    plot_deriv(axes[1], "val_loss",   "d(val loss)/d(step)",   "darkorange")
+    axes[1].set_title(f"Loss Derivative  (deriv-smooth={max(args.deriv_smooth, args.smooth)})")
+    axes[1].set_ylabel("Δloss / step")
+
+    # ── Panel 2: discriminator ────────────────────────────────────────────────
     if has_disc or has_bad_sample:
-        plot(axes[1], "disc_loss",       "disc loss",       "mediumpurple")
-        plot(axes[1], "bad_sample_loss", "bad sample loss", "goldenrod")
-        axes[1].set_title("Discriminator")
-        axes[1].set_ylabel("loss")
-        axes[1].axhline(0, color="gray", linewidth=0.8, linestyle="--")
+        plot(axes[2], "disc_loss",       "disc loss",       "mediumpurple")
+        plot(axes[2], "bad_sample_loss", "bad sample loss", "goldenrod")
+        axes[2].set_title("Discriminator")
+        axes[2].set_ylabel("loss")
+        axes[2].axhline(0, color="gray", linewidth=0.8, linestyle="--")
 
     # ── Panel last: learning rate ─────────────────────────────────────────────
     plot(axes[-1], "lr", "learning rate (Prodigy)", "seagreen")
