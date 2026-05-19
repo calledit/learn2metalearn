@@ -6,7 +6,7 @@ The core question: can a learned critic find improvement directions that standar
 
 ## Origin
 
-This project grew out of [Stateweaver](./Stateweaver/), where the same idea was first explored using a 3-network setup (Generator, Refiner, Discriminator). Here the architecture is simplified to 2 networks: the Discriminator alone guides updates by serving as a differentiable objective for gradient ascent through the Generator's weights. No separate refiner network is needed.
+This project grew out of Stateweaver, where the same idea was first explored using a 3-network setup (Generator, Refiner, Discriminator). Here the architecture is simplified to 2 networks: the Discriminator alone guides updates by serving as a differentiable objective for gradient ascent through the Generator's weights. No separate refiner network is needed.
 
 ## Concept
 
